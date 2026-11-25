@@ -1,13 +1,15 @@
+import sqlite3
+import io
+from datetime import datetime
+
+import pandas as pd
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import Response
+
 from backend.database import get_db
-import pandas as pd
-import io
-import re
-from datetime import datetime
-from typing import Dict, Any, List
 
 router = APIRouter(prefix="/api/uploads", tags=["CSV Upload"])
+
 
 SAMPLE_CSV_CONTENT = """timestamp,consumer_id,meter_id,category,feeder_id,transformer_id,voltage,current,power,energy_kwh,power_factor,connected_load_capacity
 2026-11-20 08:00:00,CON-RES-101,MTR-RES-101,Residential,FDR-NORTH-01,TR-102,231.2,5.2,1.15,1.15,0.95,3.0
@@ -17,187 +19,537 @@ SAMPLE_CSV_CONTENT = """timestamp,consumer_id,meter_id,category,feeder_id,transf
 2026-11-20 08:00:00,CON-IND-301,MTR-IND-301,Industrial,FDR-NORTH-01,TR-101,416.0,65.2,42.50,42.50,0.91,75.0
 """
 
+
+def read_csv_file(content):
+    try:
+        df = pd.read_csv(io.BytesIO(content))
+        df.columns = df.columns.astype(str).str.strip().str.lower()
+
+        # Support alternate dataset column names
+        aliases = {
+            "voltage_v": "voltage",
+            "current_a": "current"
+        }
+
+        for old, new in aliases.items():
+            if old in df.columns and new not in df.columns:
+                df[new] = df[old]
+
+        return df
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to parse CSV: {str(e)}"
+        )
+
+
+def get_text(row, column, default):
+    value = row.get(column, default)
+
+    if pd.isna(value) or str(value).strip() == "":
+        return str(default)
+
+    return str(value).strip()
+
+
+def get_number(row, column, default=None):
+    value = row.get(column, default)
+
+    if pd.isna(value):
+        return default
+
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
 @router.get("/template")
 def download_template():
     return Response(
         content=SAMPLE_CSV_CONTENT,
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=voltguard_sample_readings_template.csv"}
+        headers={
+            "Content-Disposition":
+            "attachment; filename=voltguard_sample_readings_template.csv"
+        }
     )
+
 
 @router.post("/preview")
 async def preview_csv(file: UploadFile = File(...)):
-    if not file.filename.endswith(('.csv', '.txt')):
-        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
+
+    if not file.filename.lower().endswith((".csv", ".txt")):
+        raise HTTPException(
+            status_code=400,
+            detail="Only CSV files are supported."
+        )
 
     content = await file.read()
-    try:
-        df = pd.read_csv(io.BytesIO(content))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {str(e)}")
+    df = read_csv_file(content)
 
-    preview_rows = df.head(10).to_dict(orient="records")
     columns = list(df.columns)
-    
-    # Assess capabilities based on available columns
     capabilities = []
-    if "energy_kwh" in columns and "timestamp" in columns and "consumer_id" in columns:
-        capabilities.append("Consumer-level Normal Consumption Baseline Learning")
-        capabilities.append("Isolation Forest Anomaly Detection")
-        capabilities.append("Temporal Consumption Trend Analysis")
+
+    if all(c in columns for c in [
+        "timestamp", "consumer_id", "energy_kwh"
+    ]):
+        capabilities.extend([
+            "Consumer-level Normal Consumption Baseline Learning",
+            "Isolation Forest Anomaly Detection",
+            "Temporal Consumption Trend Analysis"
+        ])
+
     if "transformer_id" in columns and "energy_kwh" in columns:
-        capabilities.append("Transformer Aggregation & Discrepancy Analysis")
+        capabilities.append(
+            "Transformer Aggregation & Discrepancy Analysis"
+        )
+
     if "feeder_id" in columns and "energy_kwh" in columns:
         capabilities.append("Feeder Energy Accounting")
+
     if "power_factor" in columns:
-        capabilities.append("Power Factor Tampering & Reactive Power Analysis")
+        capabilities.append(
+            "Power Factor Tampering & Reactive Power Analysis"
+        )
 
     return {
         "filename": file.filename,
         "total_rows_detected": len(df),
         "columns": columns,
-        "preview": preview_rows,
+        "preview": df.head(10).fillna("").to_dict(orient="records"),
         "supported_analyses": capabilities,
-        "missing_essential_columns": [col for col in ["timestamp", "consumer_id", "energy_kwh"] if col not in columns]
+        "missing_essential_columns": [
+            c for c in [
+                "timestamp", "consumer_id", "energy_kwh"
+            ] if c not in columns
+        ]
     }
+
 
 @router.post("/process")
 async def process_csv(file: UploadFile = File(...)):
-    if not file.filename.endswith(('.csv', '.txt')):
-        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
+
+    if not file.filename.lower().endswith((".csv", ".txt")):
+        raise HTTPException(
+            status_code=400,
+            detail="Only CSV files are supported."
+        )
 
     content = await file.read()
-    try:
-        df = pd.read_csv(io.BytesIO(content))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {str(e)}")
+    df = read_csv_file(content)
 
-    errors = []
-    required_cols = ["timestamp", "consumer_id", "energy_kwh"]
-    for col in required_cols:
-        if col not in df.columns:
-            errors.append(f"Missing mandatory column: '{col}'")
+    required_cols = [
+        "timestamp",
+        "consumer_id",
+        "energy_kwh"
+    ]
 
-    if errors:
-        return {
-            "status": "error",
-            "message": "Validation failed",
-            "errors": errors,
-            "total_rows": len(df),
-            "valid_rows": 0
-        }
+    missing = [c for c in required_cols if c not in df.columns]
 
-    # Data validation
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing mandatory columns: {', '.join(missing)}"
+        )
+
     initial_count = len(df)
-    
-    # Check nulls in essentials
-    df_clean = df.dropna(subset=required_cols).copy()
-    null_rows = initial_count - len(df_clean)
-    if null_rows > 0:
-        errors.append(f"Dropped {null_rows} rows with missing timestamp, consumer_id, or energy_kwh")
+    warnings = []
 
-    # Validate timestamps
+    df = df.dropna(subset=required_cols).copy()
+
+    df["consumer_id"] = df["consumer_id"].astype(str).str.strip()
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"], errors="coerce"
+    )
+
+    df["energy_kwh"] = pd.to_numeric(
+        df["energy_kwh"], errors="coerce"
+    )
+
+    df = df.dropna(
+        subset=["timestamp", "energy_kwh"]
+    )
+
+    df = df[df["consumer_id"] != ""]
+
+    if (df["energy_kwh"] < 0).any():
+        raise HTTPException(
+            status_code=400,
+            detail="Energy consumption cannot be negative."
+        )
+
+    before_duplicates = len(df)
+
+    df = df.drop_duplicates(
+        subset=["timestamp", "consumer_id"],
+        keep="last"
+    )
+
+    if len(df) < before_duplicates:
+        warnings.append(
+            f"Removed {before_duplicates - len(df)} duplicate readings."
+        )
+
+    if len(df) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid readings found."
+        )
+
+    valid_rows = len(df)
+
     try:
-        df_clean['parsed_ts'] = pd.to_datetime(df_clean['timestamp'], errors='coerce')
-        invalid_ts_count = df_clean['parsed_ts'].isna().sum()
-        if invalid_ts_count > 0:
-            errors.append(f"Found {invalid_ts_count} rows with invalid timestamp format")
-            df_clean = df_clean.dropna(subset=['parsed_ts'])
-    except Exception as e:
-        errors.append(f"Timestamp validation error: {str(e)}")
 
-    # Ensure energy_kwh is numeric
-    df_clean['energy_kwh'] = pd.to_numeric(df_clean['energy_kwh'], errors='coerce')
-    invalid_kwh = df_clean['energy_kwh'].isna().sum()
-    if invalid_kwh > 0:
-        errors.append(f"Found {invalid_kwh} rows with non-numeric energy_kwh")
-        df_clean = df_clean.dropna(subset=['energy_kwh'])
+        with get_db() as conn:
 
-    # Drop duplicates
-    dup_count = df_clean.duplicated(subset=['timestamp', 'consumer_id']).sum()
-    if dup_count > 0:
-        errors.append(f"Removed {dup_count} duplicate timestamp readings for the same consumer")
-        df_clean = df_clean.drop_duplicates(subset=['timestamp', 'consumer_id'])
+            cursor = conn.cursor()
 
-    valid_rows = len(df_clean)
+            # STEP 1: Create feeder records
 
-    # Store into SQLite
-    with get_db() as conn:
-        cursor = conn.cursor()
+            feeder_records = {}
 
-        # Check existing consumers or create them if provided
-        existing_consumers = set(r["consumer_id"] for r in cursor.execute("SELECT consumer_id FROM Consumers").fetchall())
-        new_consumer_ids = set(df_clean['consumer_id'].astype(str)) - existing_consumers
+            for _, row in df.iterrows():
 
-        if new_consumer_ids:
-            # Auto-register new consumers if needed
-            new_c_records = []
-            for cid in new_consumer_ids:
-                row_sample = df_clean[df_clean['consumer_id'] == cid].iloc[0]
-                cat = str(row_sample.get('category', 'Residential')) if pd.notna(row_sample.get('category')) else 'Residential'
-                fdr = str(row_sample.get('feeder_id', 'FDR-NORTH-01')) if pd.notna(row_sample.get('feeder_id')) else 'FDR-NORTH-01'
-                tr = str(row_sample.get('transformer_id', 'TR-101')) if pd.notna(row_sample.get('transformer_id')) else 'TR-101'
-                load = float(row_sample.get('connected_load_capacity', 5.0)) if pd.notna(row_sample.get('connected_load_capacity')) else 5.0
-                meter = str(row_sample.get('meter_id', f"MTR-{cid}")) if pd.notna(row_sample.get('meter_id')) else f"MTR-{cid}"
+                fid = get_text(
+                    row, "feeder_id", "FDR-DEFAULT"
+                )
 
-                new_c_records.append((
-                    cid, f"Consumer {cid}", meter, cat, "Imported Location",
-                    load, fdr, tr, datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                ))
+                feeder_records[fid] = (
+                    fid,
+                    f"Feeder {fid}",
+                    "Imported Location",
+                    500.0,
+                    "Operational"
+                )
+
+            cursor.executemany("""
+                INSERT OR IGNORE INTO Feeders (
+                    feeder_id,
+                    name,
+                    location,
+                    capacity_kva,
+                    status
+                ) VALUES (?, ?, ?, ?, ?)
+            """, list(feeder_records.values()))
+
+            # STEP 2: Create transformer records
+
+            transformer_records = {}
+
+            for _, row in df.iterrows():
+
+                fid = get_text(
+                    row, "feeder_id", "FDR-DEFAULT"
+                )
+
+                tid = get_text(
+                    row, "transformer_id", "TR-DEFAULT"
+                )
+
+                if tid in transformer_records:
+                    if transformer_records[tid][1] != fid:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Transformer {tid} is mapped "
+                                f"to multiple feeders."
+                            )
+                        )
+
+                transformer_records[tid] = (
+                    tid,
+                    fid,
+                    f"Transformer {tid}",
+                    "Imported Location",
+                    250.0,
+                    "Operational"
+                )
+
+            cursor.executemany("""
+                INSERT OR IGNORE INTO Transformers (
+                    transformer_id,
+                    feeder_id,
+                    name,
+                    location,
+                    capacity_kva,
+                    status
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, list(transformer_records.values()))
+
+            # STEP 3: Register consumers
+
+            consumer_records = {}
+
+            for _, row in df.iterrows():
+
+                cid = get_text(row, "consumer_id", "")
+                fid = get_text(
+                    row, "feeder_id", "FDR-DEFAULT"
+                )
+                tid = get_text(
+                    row, "transformer_id", "TR-DEFAULT"
+                )
+
+                category = get_text(
+                    row, "category", "Residential"
+                )
+
+                meter = get_text(
+                    row, "meter_id", f"MTR-{cid}"
+                )
+
+                load = get_number(
+                    row, "connected_load_capacity", 5.0
+                )
+
+                consumer_records[cid] = (
+                    cid,
+                    f"Consumer {cid}",
+                    meter,
+                    category,
+                    "Imported Location",
+                    load,
+                    fid,
+                    tid,
+                    datetime.now().strftime("%Y-%m-%d"),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
 
             cursor.executemany("""
                 INSERT OR IGNORE INTO Consumers (
-                    consumer_id, name, meter_id, category, location,
-                    connected_load_capacity, feeder_id, transformer_id, registration_date, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """, new_c_records)
+                    consumer_id,
+                    name,
+                    meter_id,
+                    category,
+                    location,
+                    connected_load_capacity,
+                    feeder_id,
+                    transformer_id,
+                    registration_date,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, list(consumer_records.values()))
 
-        # Insert readings
-        readings_records = []
-        for _, row in df_clean.iterrows():
-            cid = str(row['consumer_id'])
-            meter = str(row.get('meter_id', f"MTR-{cid}"))
-            v = float(row['voltage']) if 'voltage' in row and pd.notna(row['voltage']) else None
-            c = float(row['current']) if 'current' in row and pd.notna(row['current']) else None
-            p = float(row['power']) if 'power' in row and pd.notna(row['power']) else float(row['energy_kwh'])
-            pf = float(row['power_factor']) if 'power_factor' in row and pd.notna(row['power_factor']) else 0.92
-            load = float(row['connected_load_capacity']) if 'connected_load_capacity' in row and pd.notna(row['connected_load_capacity']) else 5.0
+            # STEP 4: Check registered consumers
 
-            readings_records.append((
-                str(row['timestamp']), cid, meter, v, c, p, float(row['energy_kwh']), pf, load, 0
+            consumer_ids = list(consumer_records.keys())
+
+            placeholders = ",".join(
+                ["?"] * len(consumer_ids)
+            )
+
+            registered = cursor.execute(
+                f"""
+                SELECT consumer_id
+                FROM Consumers
+                WHERE consumer_id IN ({placeholders})
+                """,
+                consumer_ids
+            ).fetchall()
+
+            registered_ids = {
+                row["consumer_id"] for row in registered
+            }
+
+            missing_consumers = (
+                set(consumer_ids) - registered_ids
+            )
+
+            if missing_consumers:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Could not register consumers: "
+                        + ", ".join(sorted(missing_consumers))
+                    )
+                )
+
+            # STEP 5: Insert electricity readings
+
+            existing = cursor.execute("""
+                SELECT consumer_id, timestamp
+                FROM Electricity_Readings
+            """).fetchall()
+
+            existing_readings = {
+                (r["consumer_id"], r["timestamp"])
+                for r in existing
+            }
+
+            readings_records = []
+
+            for _, row in df.iterrows():
+
+                cid = get_text(row, "consumer_id", "")
+
+                timestamp = row["timestamp"].strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+
+                key = (cid, timestamp)
+
+                if key in existing_readings:
+                    continue
+
+                meter = get_text(
+                    row, "meter_id", f"MTR-{cid}"
+                )
+
+                readings_records.append((
+                    timestamp,
+                    cid,
+                    meter,
+                    get_number(row, "voltage"),
+                    get_number(row, "current"),
+                    get_number(row, "power"),
+                    float(row["energy_kwh"]),
+                    get_number(row, "power_factor", 0.92),
+                    get_number(
+                        row, "connected_load_capacity", 5.0
+                    ),
+                    0
+                ))
+
+                existing_readings.add(key)
+
+            cursor.executemany("""
+                INSERT INTO Electricity_Readings (
+                    timestamp,
+                    consumer_id,
+                    meter_id,
+                    voltage,
+                    current,
+                    power,
+                    energy_kwh,
+                    power_factor,
+                    connected_load_capacity,
+                    is_simulated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, readings_records)
+
+            # STEP 6: Insert feeder input readings
+
+            if "feeder_input_kwh" in df.columns:
+
+                feeder_existing_rows = cursor.execute("""
+                    SELECT feeder_id, timestamp
+                    FROM Feeder_Readings
+                """).fetchall()
+
+                feeder_existing = {
+                    (r["feeder_id"], r["timestamp"])
+                    for r in feeder_existing_rows
+                }
+
+                feeder_readings = []
+
+                for _, row in df.iterrows():
+
+                    fid = get_text(
+                        row, "feeder_id", "FDR-DEFAULT"
+                    )
+
+                    timestamp = row["timestamp"].strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+
+                    key = (fid, timestamp)
+
+                    if key in feeder_existing:
+                        continue
+
+                    feeder_input = get_number(
+                        row, "feeder_input_kwh"
+                    )
+
+                    if feeder_input is None:
+                        continue
+
+                    feeder_readings.append((
+                        fid,
+                        timestamp,
+                        feeder_input,
+                        0
+                    ))
+
+                    feeder_existing.add(key)
+
+                cursor.executemany("""
+                    INSERT INTO Feeder_Readings (
+                        feeder_id,
+                        timestamp,
+                        input_energy_kwh,
+                        is_simulated
+                    ) VALUES (?, ?, ?, ?)
+                """, feeder_readings)
+
+            # STEP 7: Save upload history
+
+            imported_count = len(readings_records)
+
+            cursor.execute("""
+                INSERT INTO Uploaded_Datasets (
+                    filename,
+                    upload_timestamp,
+                    row_count,
+                    valid_rows,
+                    status,
+                    notes
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                file.filename,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                initial_count,
+                imported_count,
+                "Success" if not warnings else "Success with Warnings",
+                "; ".join(warnings) if warnings else "Clean upload."
             ))
 
-        cursor.executemany("""
-            INSERT INTO Electricity_Readings (
-                timestamp, consumer_id, meter_id, voltage, current, power,
-                energy_kwh, power_factor, connected_load_capacity, is_simulated
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, readings_records)
+        return {
+            "status": "success",
+            "message": "Dataset successfully ingested into SQLite.",
+            "filename": file.filename,
+            "total_rows_received": initial_count,
+            "valid_rows": valid_rows,
+            "new_readings_imported": imported_count,
+            "duplicate_readings_skipped": valid_rows - imported_count,
+            "validation_warnings": warnings
+        }
 
-        # Log upload in Uploaded_Datasets
-        upload_status = "Success" if not errors else "Success with Warnings"
-        notes_str = "; ".join(errors) if errors else "Clean upload, all checks passed."
-        cursor.execute("""
-            INSERT INTO Uploaded_Datasets (
-                filename, upload_timestamp, row_count, valid_rows, status, notes
-            ) VALUES (?, ?, ?, ?, ?, ?);
-        """, (
-            file.filename, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), initial_count, valid_rows, upload_status, notes_str
-        ))
-        conn.commit()
+    except HTTPException:
+        raise
 
-    return {
-        "status": "success",
-        "message": f"Successfully processed {valid_rows} valid electricity readings from '{file.filename}'.",
-        "filename": file.filename,
-        "total_rows_received": initial_count,
-        "valid_rows_imported": valid_rows,
-        "validation_warnings": errors
-    }
+    except sqlite3.IntegrityError as e:
+        print("VOLTGUARD SQLITE ERROR:", repr(e))
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"SQLite integrity error: {str(e)}"
+        )
+
+    except Exception as e:
+        print("VOLTGUARD INGESTION ERROR:", repr(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Dataset ingestion failed: {str(e)}"
+        )
+
 
 @router.get("/history")
 def get_upload_history():
+
     with get_db() as conn:
+
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM Uploaded_Datasets ORDER BY upload_timestamp DESC;")
-        return [dict(r) for r in cursor.fetchall()]
+
+        cursor.execute("""
+            SELECT *
+            FROM Uploaded_Datasets
+            ORDER BY upload_timestamp DESC
+        """)
+
+        return [dict(row) for row in cursor.fetchall()]
